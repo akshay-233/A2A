@@ -1,0 +1,358 @@
+import asyncio
+import base64
+import json
+import os
+import re
+import subprocess
+import time
+import wave
+from datetime import datetime, timezone
+
+import requests
+import websockets
+
+# -------------------------
+# CONFIG
+# -------------------------
+AZURE_ENDPOINT = "wss://YOUR_RESOURCE.openai.azure.com/openai/realtime?api-version=2024-10-01-preview&deployment=gpt-4o-mini-realtime-preview"
+AZURE_API_KEY = "YOUR_KEY"
+
+INPUT_WAV = "input.wav"
+CONVERTED_WAV = "input_16k_mono.wav"
+OUTPUT_WAV = "output.wav"
+
+# Voice options commonly seen in Realtime: alloy, echo, fable, onyx, nova, shimmer
+# "onyx" is typically more "male-like" than alloy.
+VOICE = "onyx"
+
+# Timeouts (seconds)
+STT_TIMEOUT = 25
+TTS_TIMEOUT = 30
+
+# Requests timeouts
+HTTP_TIMEOUT = 10
+
+
+# -------------------------
+# Helpers: logging
+# -------------------------
+def ts():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def log(msg: str):
+    print(f"[{ts()}] {msg}", flush=True)
+
+
+# -------------------------
+# Audio conversion: any wav -> 16kHz PCM16 mono (ffmpeg required)
+# -------------------------
+def ensure_16k_pcm16_mono(in_path: str, out_path: str) -> None:
+    """
+    Converts input audio to WAV: 16kHz, mono, PCM16 using ffmpeg.
+    """
+    if not os.path.exists(in_path):
+        raise FileNotFoundError(f"Input file not found: {in_path}")
+
+    # Check input audio properties quickly
+    try:
+        with wave.open(in_path, "rb") as wf:
+            ch = wf.getnchannels()
+            sr = wf.getframerate()
+            sw = wf.getsampwidth()
+        log(f"Input Audio Info: channels={ch}, sample_rate={sr}, sample_width={sw}")
+    except wave.Error:
+        log("Input is not a simple WAV readable by Python wave; will still try ffmpeg conversion.")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", in_path,
+        "-ac", "1",
+        "-ar", "16000",
+        "-c:a", "pcm_s16le",
+        out_path
+    ]
+    log("Converting audio to 16kHz PCM16 mono via ffmpeg...")
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg conversion failed:\n{r.stderr}")
+
+    with wave.open(out_path, "rb") as wf:
+        ch = wf.getnchannels()
+        sr = wf.getframerate()
+        sw = wf.getsampwidth()
+        frames = wf.getnframes()
+    log(f"Converted Audio Info: channels={ch}, sample_rate={sr}, sample_width={sw}, frames={frames}")
+
+
+def read_pcm_frames(wav_path: str) -> bytes:
+    with wave.open(wav_path, "rb") as wf:
+        return wf.readframes(wf.getnframes())
+
+
+# -------------------------
+# Weather tool (Open-Meteo)
+# -------------------------
+def open_meteo_weather(city: str) -> dict:
+    """
+    Free geocoding + weather.
+    Returns small JSON that we feed into the model.
+    """
+    log(f"TOOL: geocoding city='{city}'")
+    geo = requests.get(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={"name": city, "count": 1, "language": "en", "format": "json"},
+        timeout=HTTP_TIMEOUT
+    ).json()
+
+    if "results" not in geo or not geo["results"]:
+        return {"error": "city_not_found", "city": city, "source": "open-meteo-geocoding"}
+
+    r0 = geo["results"][0]
+    lat, lon = r0["latitude"], r0["longitude"]
+    resolved_name = r0.get("name", city)
+    country = r0.get("country", "")
+
+    log(f"TOOL: weather fetch lat={lat}, lon={lon}")
+    w = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": lat,
+            "longitude": lon,
+            "current_weather": True
+        },
+        timeout=HTTP_TIMEOUT
+    ).json()
+
+    cw = w.get("current_weather") or {}
+    return {
+        "source": "open-meteo",
+        "query_city": city,
+        "resolved_city": resolved_name,
+        "country": country,
+        "latitude": lat,
+        "longitude": lon,
+        "current_weather": {
+            "temperature_c": cw.get("temperature"),
+            "windspeed_kmh": cw.get("windspeed"),
+            "winddirection_deg": cw.get("winddirection"),
+            "weathercode": cw.get("weathercode"),
+            "time": cw.get("time")
+        },
+        "fetched_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")
+    }
+
+
+# -------------------------
+# Transcript parsing (strict)
+# -------------------------
+def parse_location_from_json(text: str) -> str | None:
+    """
+    Expect strict JSON like {"location":"Hyderabad"}.
+    If model returns extra text, try to extract JSON blob.
+    """
+    text = text.strip()
+
+    # Try direct JSON
+    try:
+        obj = json.loads(text)
+        loc = obj.get("location")
+        if isinstance(loc, str) and loc.strip():
+            return loc.strip()
+    except Exception:
+        pass
+
+    # Try to extract JSON block
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            loc = obj.get("location")
+            if isinstance(loc, str) and loc.strip():
+                return loc.strip()
+        except Exception:
+            pass
+
+    # Fallback heuristic: "in <city>"
+    m2 = re.search(r"\bin\s+([A-Za-z][A-Za-z\s\-]{1,40})\b", text)
+    if m2:
+        return m2.group(1).strip()
+
+    return None
+
+
+# -------------------------
+# WebSocket event pump with timeout
+# -------------------------
+async def recv_with_timeout(ws, timeout_s: int):
+    return await asyncio.wait_for(ws.recv(), timeout=timeout_s)
+
+
+# -------------------------
+# MAIN PIPELINE
+# -------------------------
+async def run_pipeline():
+    # 0) Convert audio
+    ensure_16k_pcm16_mono(INPUT_WAV, CONVERTED_WAV)
+    pcm = read_pcm_frames(CONVERTED_WAV)
+    pcm_b64 = base64.b64encode(pcm).decode("utf-8")
+
+    headers = {"api-key": AZURE_API_KEY}
+
+    log("Connecting to Azure Realtime WebSocket...")
+    async with websockets.connect(
+        AZURE_ENDPOINT,
+        additional_headers=headers,
+        max_size=50 * 1024 * 1024,
+        ping_interval=20,
+        ping_timeout=20
+    ) as ws:
+        log("✅ Connected.")
+
+        # ---------------------------------------------------------
+        # 1) STT PHASE (TEXT ONLY) - force JSON output
+        # ---------------------------------------------------------
+        log("STT PHASE: request transcript as strict JSON ONLY (no tool, no audio response).")
+
+        await ws.send(json.dumps({
+            "type": "session.update",
+            "session": {
+                "modalities": ["text"],   # IMPORTANT: text only in STT phase
+                "input_audio_transcription": {"model": "whisper-1"},
+                "turn_detection": {"type": "server_vad"},
+                "temperature": 0
+            }
+        }))
+
+        # Send audio into input buffer
+        await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": pcm_b64}))
+        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+
+        # Create a TEXT response that returns ONLY JSON {location:"..."}
+        await ws.send(json.dumps({
+            "type": "response.create",
+            "response": {
+                "modalities": ["text"],
+                "instructions": (
+                    "You will receive user speech. "
+                    "TASK: Extract the city/location they are asking about. "
+                    "Return STRICT JSON ONLY in this exact format: {\"location\":\"<city>\"}. "
+                    "No extra keys. No extra words. No punctuation outside JSON."
+                )
+            }
+        }))
+
+        stt_text = ""
+        stt_deadline = time.time() + STT_TIMEOUT
+
+        while True:
+            remaining = max(1, int(stt_deadline - time.time()))
+            try:
+                raw = await recv_with_timeout(ws, remaining)
+            except asyncio.TimeoutError:
+                log("❌ STT TIMEOUT: did not receive response.done in time.")
+                break
+
+            msg = json.loads(raw)
+            etype = msg.get("type", "")
+            log(f"EVENT(STT): {etype}")
+
+            if etype == "response.text.delta":
+                stt_text += msg.get("delta", "")
+
+            if etype == "response.done":
+                break
+
+            if etype == "error":
+                log(f"❌ ERROR(STT): {msg}")
+                break
+
+        log(f"STT RAW TEXT: {stt_text!r}")
+
+        city = parse_location_from_json(stt_text)
+        if not city:
+            log("❌ Could not parse city from STT output. (Model didn’t return valid JSON)")
+            return
+
+        log(f"✅ Parsed city: {city}")
+
+        # ---------------------------------------------------------
+        # 2) TOOL PHASE (your Python function)
+        # ---------------------------------------------------------
+        tool_json = open_meteo_weather(city)
+        log(f"✅ TOOL OUTPUT JSON: {tool_json}")
+
+        # If tool failed, still proceed but the model will explain error
+        tool_payload = json.dumps(tool_json, ensure_ascii=False)
+
+        # ---------------------------------------------------------
+        # 3) TTS PHASE (AUDIO ONLY) - force using tool_json
+        # ---------------------------------------------------------
+        log("TTS PHASE: forcing audio output using ONLY tool JSON (no generic answer).")
+
+        await ws.send(json.dumps({
+            "type": "session.update",
+            "session": {
+                "modalities": ["audio"],   # IMPORTANT: audio only in TTS phase
+                "voice": VOICE,
+                "temperature": 0
+            }
+        }))
+
+        # Request audio response; we embed the tool JSON into instructions
+        await ws.send(json.dumps({
+            "type": "response.create",
+            "response": {
+                "modalities": ["audio"],
+                "instructions": (
+                    "Speak ONLY in English. "
+                    "You MUST use ONLY the following TOOL_DATA to answer. "
+                    "Do NOT add disclaimers like 'weather may change' or 'check an app'. "
+                    "If TOOL_DATA contains an error, say you couldn't fetch the weather and why. "
+                    "Keep it concise (1-2 sentences).\n\n"
+                    f"TOOL_DATA:\n{tool_payload}"
+                )
+            }
+        }))
+
+        audio_bytes = b""
+        tts_deadline = time.time() + TTS_TIMEOUT
+
+        while True:
+            remaining = max(1, int(tts_deadline - time.time()))
+            try:
+                raw = await recv_with_timeout(ws, remaining)
+            except asyncio.TimeoutError:
+                log("❌ TTS TIMEOUT: did not receive response.done in time.")
+                break
+
+            msg = json.loads(raw)
+            etype = msg.get("type", "")
+            log(f"EVENT(TTS): {etype}")
+
+            if etype == "response.audio.delta":
+                audio_bytes += base64.b64decode(msg.get("delta", ""))
+
+            if etype == "response.done":
+                break
+
+            if etype == "error":
+                log(f"❌ ERROR(TTS): {msg}")
+                break
+
+        if not audio_bytes:
+            log("❌ No audio received. This usually means deployment/voice/audio output not enabled for this deployment.")
+            return
+
+        # Save WAV
+        with wave.open(OUTPUT_WAV, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)   # PCM16
+            wf.setframerate(16000)
+            wf.writeframes(audio_bytes)
+
+        log(f"🎉 Saved audio to {OUTPUT_WAV}")
+
+
+if __name__ == "__main__":
+    asyncio.run(run_pipeline())
