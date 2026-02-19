@@ -1,0 +1,433 @@
+import argparse
+import asyncio
+import base64
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import wave
+from typing import Any, Dict, Optional, Tuple
+
+import requests
+import websockets
+
+
+# =========================
+# UTIL: robust websockets.connect kwargs across versions
+# =========================
+def ws_connect_kwargs(headers: Dict[str, str]) -> Dict[str, Any]:
+    """
+    websockets versions differ:
+      - v10/v11/v12: extra_headers=
+      - some forks/examples use additional_headers=
+    We'll detect by signature at runtime.
+    """
+    import inspect
+    sig = inspect.signature(websockets.connect)
+    if "extra_headers" in sig.parameters:
+        return {"extra_headers": headers}
+    if "additional_headers" in sig.parameters:
+        return {"additional_headers": headers}
+    # fallback (rare)
+    return {"extra_headers": headers}
+
+
+# =========================
+# AUDIO: convert ANY WAV -> 16k PCM16 mono WAV
+# =========================
+def ensure_ffmpeg():
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError(
+            "ffmpeg not found. Install it:\n"
+            "  sudo apt-get update && sudo apt-get install -y ffmpeg"
+        )
+
+def convert_to_16k_pcm16_mono(in_path: str, out_path: str) -> None:
+    ensure_ffmpeg()
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        in_path,
+        "-ac",
+        "1",          # mono
+        "-ar",
+        "16000",      # 16kHz
+        "-f",
+        "wav",
+        "-c:a",
+        "pcm_s16le",  # PCM16 little-endian
+        out_path,
+    ]
+    subprocess.check_call(cmd)
+
+def wav_info(path: str) -> Tuple[int, int, int, int]:
+    with wave.open(path, "rb") as wf:
+        return (wf.getnchannels(), wf.getsampwidth(), wf.getframerate(), wf.getnframes())
+
+def read_wav_frames(path: str) -> bytes:
+    with wave.open(path, "rb") as wf:
+        return wf.readframes(wf.getnframes())
+
+def write_wav_pcm16_mono_16k(path: str, pcm16_frames: bytes) -> None:
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)     # 16-bit
+        wf.setframerate(16000)
+        wf.writeframes(pcm16_frames)
+
+
+# =========================
+# TOOL: Open-Meteo (no key)
+# 1) geocoding -> lat/lon
+# 2) forecast -> current weather
+# =========================
+SESSION = requests.Session()
+
+def http_get_json(url: str, params: Dict[str, Any], timeout: int = 10) -> Dict[str, Any]:
+    # enterprise-ish retries
+    for attempt in range(3):
+        try:
+            r = SESSION.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            if attempt == 2:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+    raise RuntimeError("unreachable")
+
+def geocode_city(city: str) -> Tuple[float, float, str]:
+    url = "https://geocoding-api.open-meteo.com/v1/search"
+    data = http_get_json(url, {"name": city, "count": 1, "language": "en", "format": "json"})
+    results = data.get("results") or []
+    if not results:
+        raise ValueError(f"City not found in geocoding: {city}")
+    top = results[0]
+    lat = float(top["latitude"])
+    lon = float(top["longitude"])
+    label = f'{top.get("name","")}, {top.get("country","")}'.strip().strip(",")
+    return lat, lon, label
+
+def get_weather_open_meteo(city: str) -> Dict[str, Any]:
+    lat, lon, label = geocode_city(city)
+    url = "https://api.open-meteo.com/v1/forecast"
+    data = http_get_json(
+        url,
+        {
+            "latitude": lat,
+            "longitude": lon,
+            "current_weather": "true",
+            "timezone": "auto",
+        },
+    )
+    cw = data.get("current_weather") or {}
+    # Keep it clean + usable for TTS
+    return {
+        "city_input": city,
+        "resolved_place": label,
+        "latitude": lat,
+        "longitude": lon,
+        "temperature_c": cw.get("temperature"),
+        "windspeed_kmh": cw.get("windspeed"),
+        "winddirection_deg": cw.get("winddirection"),
+        "weathercode": cw.get("weathercode"),
+        "time": cw.get("time"),
+        "source": "open-meteo.com",
+    }
+
+
+# =========================
+# REALTIME PIPELINE (ENTERPRISE ENFORCED)
+# - audio in -> STT transcript
+# - MUST tool call get_weather(city)
+# - tool output returned
+# - MUST generate english audio output.wav
+# =========================
+class State:
+    def __init__(self):
+        self.session_created = False
+        self.transcript = ""
+        self.tool_called = False
+        self.tool_name = None
+        self.tool_call_id = None
+        self.tool_args_raw = None
+        self.tool_result = None
+
+        self.final_text = ""
+        self.audio_bytes = b""
+        self.got_audio = False
+        self.response_done = False
+        self.errors = []
+
+async def enterprise_weather_s2s(
+    endpoint_wss: str,
+    api_key: str,
+    in_wav: str,
+    out_wav: str,
+    voice: str,
+    hard_timeout_sec: int = 60,
+) -> None:
+    st = State()
+
+    # Convert audio to correct format always
+    converted = "converted_16k_pcm16_mono.wav"
+    print("🔁 Converting input audio -> 16kHz PCM16 mono ...")
+    convert_to_16k_pcm16_mono(in_wav, converted)
+    ch, sw, fr, nf = wav_info(converted)
+    print(f"✅ Converted Audio Info: channels={ch}, sampwidth={sw}, framerate={fr}, frames={nf}")
+    if fr != 16000 or ch != 1 or sw != 2:
+        print("⚠️ Conversion output not expected. Stopping.")
+        return
+
+    audio_frames = read_wav_frames(converted)
+    audio_b64 = base64.b64encode(audio_frames).decode("utf-8")
+
+    headers = {"api-key": api_key}
+
+    print("🔌 Connecting to Azure Realtime ...")
+    connect_args = ws_connect_kwargs(headers)
+    # Important: keep max_size large for audio
+    async with websockets.connect(
+        endpoint_wss,
+        max_size=50 * 1024 * 1024,
+        ping_interval=20,
+        ping_timeout=20,
+        **connect_args,
+    ) as ws:
+        print("✅ Connected.")
+
+        # 1) Session update: enable audio+text, define tool, force English
+        session_update = {
+            "type": "session.update",
+            "session": {
+                "modalities": ["audio", "text"],
+                "voice": voice,
+                # Strong “English only” + “must call tool” behavior guidance
+                "instructions": (
+                    "You are a weather assistant.\n"
+                    "Always respond in English only.\n"
+                    "Do NOT guess weather. You MUST use the get_weather tool.\n"
+                    "After tool results, speak a short, factual summary.\n"
+                    "No disclaimers. No generic advice. Use the tool output only.\n"
+                ),
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "Get current weather for a city using Open-Meteo",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "city": {"type": "string", "description": "City name, e.g., Hyderabad"},
+                                },
+                                "required": ["city"],
+                            },
+                        },
+                    }
+                ],
+            },
+        }
+        await ws.send(json.dumps(session_update))
+
+        # 2) Send audio buffer
+        await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio_b64}))
+        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+
+        # 3) Create response AND FORCE TOOL CALL
+        # This is the enterprise enforcement:
+        # - tool_choice: required
+        # - ask the model to extract city from user's query and call get_weather
+        forced = {
+            "type": "response.create",
+            "response": {
+                "modalities": ["text"],  # First stage: tool call + transcript in text
+                "tool_choice": {
+                    "type": "function",
+                    "function": "get_weather",
+                },
+                "instructions": (
+                    "From the user's audio, extract the city.\n"
+                    "Call get_weather(city) immediately.\n"
+                    "Return ONLY the tool call. Do not answer yet."
+                ),
+            },
+        }
+        await ws.send(json.dumps(forced))
+        print("🧭 Waiting for events (tool call stage) ...")
+
+        start = time.time()
+
+        async def ensure_timeout():
+            if time.time() - start > hard_timeout_sec:
+                raise TimeoutError(f"Hard timeout exceeded ({hard_timeout_sec}s)")
+
+        # Event loop stage 1: wait until tool call appears
+        while not st.tool_called:
+            await ensure_timeout()
+            msg = await ws.recv()
+            data = json.loads(msg)
+            et = data.get("type")
+            print(f"EVENT: {et}")
+
+            if et == "error":
+                st.errors.append(data)
+                print("❌ ERROR EVENT:", json.dumps(data, indent=2))
+                # keep going unless fatal timeout
+
+            # transcript events can vary across versions; capture what we can
+            if et in ("response.audio_transcript.delta", "response.text.delta"):
+                delta = data.get("delta", "")
+                st.transcript += delta
+
+            # Tool call usually appears in response.output_item.added
+            if et == "response.output_item.added":
+                item = data.get("item") or {}
+                if item.get("type") == "function_call":
+                    st.tool_called = True
+                    st.tool_name = item.get("name")
+                    st.tool_call_id = item.get("call_id")
+                    st.tool_args_raw = item.get("arguments")
+                    print("🛠 TOOL CALL DETECTED")
+                    print("   name:", st.tool_name)
+                    print("   call_id:", st.tool_call_id)
+                    print("   arguments(raw):", st.tool_args_raw)
+
+        # Validate tool call
+        if st.tool_name != "get_weather" or not st.tool_call_id:
+            print("❌ Tool call invalid / missing. Check events above.")
+            return
+
+        # Parse args
+        try:
+            args = json.loads(st.tool_args_raw) if isinstance(st.tool_args_raw, str) else (st.tool_args_raw or {})
+        except Exception:
+            args = {}
+        city = (args.get("city") or "").strip()
+        if not city:
+            # enterprise fallback: ask user to re-record is possible; here we fail loudly
+            print("❌ Could not extract city from tool arguments. Raw:", st.tool_args_raw)
+            return
+
+        print(f"🌦 Calling tool get_weather for city: {city}")
+        try:
+            tool_result = get_weather_open_meteo(city)
+        except Exception as e:
+            tool_result = {"error": str(e), "city_input": city, "source": "open-meteo.com"}
+        st.tool_result = tool_result
+        print("🧾 Tool result:", json.dumps(tool_result, indent=2))
+
+        # 4) Send tool output back to model
+        tool_output_event = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": st.tool_call_id,
+                "output": json.dumps(tool_result),
+            },
+        }
+        await ws.send(json.dumps(tool_output_event))
+
+        # 5) Now ask model to speak the FINAL answer in English (AUDIO)
+        final_create = {
+            "type": "response.create",
+            "response": {
+                "modalities": ["audio", "text"],
+                "tool_choice": "none",  # tools already used; now speak the answer
+                "voice": voice,
+                "instructions": (
+                    "Use ONLY the tool output you received.\n"
+                    "Respond in English.\n"
+                    "Speak clearly and briefly (1-2 sentences).\n"
+                    "Do NOT add disclaimers or extra advice.\n"
+                    "Format: 'In <resolved_place>, it is <temperature_c> degrees Celsius with wind speed <windspeed_kmh> kilometers per hour.'\n"
+                ),
+            },
+        }
+        await ws.send(json.dumps(final_create))
+        print("🔊 Waiting for audio chunks (final answer) ...")
+
+        # Event loop stage 2: collect audio + final text
+        while not st.response_done:
+            await ensure_timeout()
+            msg = await ws.recv()
+            data = json.loads(msg)
+            et = data.get("type")
+            print(f"EVENT: {et}")
+
+            if et == "error":
+                st.errors.append(data)
+                print("❌ ERROR EVENT:", json.dumps(data, indent=2))
+
+            if et == "response.audio.delta":
+                chunk = base64.b64decode(data.get("delta", ""))
+                st.audio_bytes += chunk
+                st.got_audio = True
+
+            if et == "response.text.delta":
+                st.final_text += data.get("delta", "")
+
+            if et == "response.done":
+                st.response_done = True
+
+        # Save audio if present
+        if st.got_audio and st.audio_bytes:
+            write_wav_pcm16_mono_16k(out_wav, st.audio_bytes)
+            print(f"✅ Saved audio output: {out_wav}")
+        else:
+            print("❌ No audio received.")
+            print("   Possible causes:")
+            print("   - Your Azure deployment does NOT support audio output (voice).")
+            print("   - Voice permissions not enabled on that deployment.")
+            print("   - Wrong endpoint/deployment in URL.")
+            print("   - Audio modality disabled by service policy.")
+            print("   Check ERROR events above (if any).")
+
+        # Print transcript + final text for debugging
+        if st.transcript.strip():
+            print("\n📝 Partial Transcript (from model events):")
+            print(st.transcript.strip())
+
+        if st.final_text.strip():
+            print("\n🧠 Final Text (what model said):")
+            print(st.final_text.strip())
+
+
+def build_argparser():
+    p = argparse.ArgumentParser(
+        description="Enterprise-enforced Azure Realtime S2S weather tool pipeline (audio->tool->audio)."
+    )
+    p.add_argument("--endpoint", required=True,
+                   help="Full WSS endpoint including api-version and deployment, e.g. wss://<res>.openai.azure.com/openai/realtime?api-version=2024-10-01-preview&deployment=<DEPLOY>")
+    p.add_argument("--key", required=True, help="Azure OpenAI API key")
+    p.add_argument("--in_wav", required=True, help="Input audio file (any wav); user asks 'what is weather in <city>'")
+    p.add_argument("--out_wav", default="output.wav", help="Output wav path (16kHz PCM16 mono)")
+    p.add_argument("--voice", default="alloy", help="Voice name (must be supported by your deployment)")
+    p.add_argument("--timeout", type=int, default=60, help="Hard timeout seconds")
+    return p
+
+
+async def main_async(args):
+    await enterprise_weather_s2s(
+        endpoint_wss=args.endpoint,
+        api_key=args.key,
+        in_wav=args.in_wav,
+        out_wav=args.out_wav,
+        voice=args.voice,
+        hard_timeout_sec=args.timeout,
+    )
+
+
+def main():
+    args = build_argparser().parse_args()
+    asyncio.run(main_async(args))
+
+
+if __name__ == "__main__":
+    main()
