@@ -1,0 +1,405 @@
+import asyncio
+import base64
+import json
+import os
+import re
+import subprocess
+import wave
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import requests
+import websockets
+
+# =========================
+# CONFIG (EDIT THESE)
+# =========================
+AZURE_RESOURCE_NAME = "YOUR_RESOURCE_NAME"  # e.g. blueverse-gpt5
+AZURE_DEPLOYMENT = "gpt-4o-mini-realtime-preview"
+AZURE_API_KEY = "YOUR_API_KEY"
+
+# Realtime WS endpoint
+AZURE_ENDPOINT = (
+    f"wss://{AZURE_RESOURCE_NAME}.openai.azure.com/openai/realtime"
+    f"?api-version=2024-10-01-preview&deployment={AZURE_DEPLOYMENT}"
+)
+
+# Voice: Azure supports a small set; alloy is common. If you have others enabled, change here.
+VOICE = "alloy"
+
+# Output audio format we write
+OUT_SR = 16000
+OUT_CH = 1
+OUT_SW = 2  # 16-bit
+
+# HTTP timeouts for tool calls
+HTTP_TIMEOUT = 12
+
+
+# =========================
+# UTIL: Debug printing
+# =========================
+def log(msg: str):
+    print(msg, flush=True)
+
+
+# =========================
+# AUDIO: convert anything -> 16k mono PCM16 wav using ffmpeg
+# =========================
+def convert_to_16k_pcm16_mono(input_path: str) -> str:
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input audio not found: {input_path}")
+
+    out_path = os.path.splitext(input_path)[0] + "_16k_pcm16.wav"
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-ac", "1",
+        "-ar", str(OUT_SR),
+        "-f", "wav",
+        "-acodec", "pcm_s16le",
+        out_path
+    ]
+    log("🔁 Converting audio to 16kHz PCM16 mono...")
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        log("❌ ffmpeg failed:")
+        log(p.stderr)
+        raise RuntimeError("ffmpeg conversion failed")
+
+    # Validate wav info
+    with wave.open(out_path, "rb") as wf:
+        ch = wf.getnchannels()
+        sr = wf.getframerate()
+        sw = wf.getsampwidth()
+        frames = wf.getnframes()
+    log(f"✅ Converted audio: channels={ch}, sr={sr}, sampwidth={sw}, frames={frames}")
+    return out_path
+
+
+def read_wav_bytes(wav_path: str) -> bytes:
+    with wave.open(wav_path, "rb") as wf:
+        return wf.readframes(wf.getnframes())
+
+
+# =========================
+# TOOL: Open-Meteo (No API key)
+#   1) Geocode city -> lat/lon
+#   2) Forecast current weather
+# =========================
+@dataclass
+class WeatherResult:
+    city: str
+    latitude: float
+    longitude: float
+    temp_c: float
+    wind_kmh: float
+    weather_code: int
+
+
+def open_meteo_geocode(city: str) -> Tuple[float, float, str]:
+    url = "https://geocoding-api.open-meteo.com/v1/search"
+    params = {"name": city, "count": 1, "language": "en", "format": "json"}
+    r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    results = data.get("results") or []
+    if not results:
+        raise ValueError(f"No geocoding results for city: {city}")
+    top = results[0]
+    return float(top["latitude"]), float(top["longitude"]), top.get("name", city)
+
+
+def open_meteo_current(lat: float, lon: float) -> Tuple[float, float, int]:
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m,wind_speed_10m,weather_code",
+        "timezone": "auto",
+    }
+    r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    cur = data.get("current") or {}
+    temp = float(cur.get("temperature_2m"))
+    wind = float(cur.get("wind_speed_10m"))
+    code = int(cur.get("weather_code"))
+    return temp, wind, code
+
+
+def fetch_weather(city: str) -> WeatherResult:
+    log(f"🌦️ Tool: Fetching weather via Open-Meteo for: {city}")
+    lat, lon, canonical = open_meteo_geocode(city)
+    temp, wind, code = open_meteo_current(lat, lon)
+    return WeatherResult(
+        city=canonical,
+        latitude=lat,
+        longitude=lon,
+        temp_c=temp,
+        wind_kmh=wind,
+        weather_code=code,
+    )
+
+
+# =========================
+# REALTIME: helpers
+# =========================
+async def ws_send(ws, obj):
+    payload = json.dumps(obj)
+    await ws.send(payload)
+
+
+async def recv_loop(ws, stop_types: set, debug_prefix="EVENT"):
+    """
+    Receives events until one of stop_types is hit.
+    Returns list of all events received (dicts).
+    """
+    events = []
+    while True:
+        raw = await ws.recv()
+        evt = json.loads(raw)
+        et = evt.get("type")
+        log(f"{debug_prefix}: {et}")
+        events.append(evt)
+        if et in stop_types:
+            return events
+
+
+def extract_text_deltas(events, delta_type: str) -> str:
+    """
+    Collects all deltas of a certain type from event list and returns concatenated text.
+    For realtime, common text delta types:
+      - response.text.delta
+      - response.audio_transcript.delta (if present)
+    """
+    out = []
+    for e in events:
+        if e.get("type") == delta_type:
+            # usually uses "delta"
+            out.append(e.get("delta", ""))
+    return "".join(out)
+
+
+def extract_audio_bytes(events) -> bytes:
+    """
+    Collect all response.audio.delta and decode base64 into raw PCM bytes.
+    """
+    audio = b""
+    for e in events:
+        if e.get("type") == "response.audio.delta":
+            audio += base64.b64decode(e["delta"])
+    return audio
+
+
+def write_wav(path: str, pcm_bytes: bytes, sr=OUT_SR, ch=OUT_CH, sw=OUT_SW):
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(ch)
+        wf.setsampwidth(sw)
+        wf.setframerate(sr)
+        wf.writeframes(pcm_bytes)
+
+
+# =========================
+# PHASE 1: STT (audio -> transcript)
+# =========================
+async def phase1_transcribe(ws, pcm16_wav_path: str) -> str:
+    log("1) Phase-1 STT: forcing transcription only (no answering).")
+
+    # Text-only output is safer so model doesn't “answer as audio”
+    await ws_send(ws, {
+        "type": "session.update",
+        "session": {
+            "modalities": ["text"],  # IMPORTANT: only text output
+            "instructions": (
+                "You are a speech-to-text engine. "
+                "Return ONLY the exact transcription of the user's speech in English. "
+                "Do NOT answer the question. Do NOT add explanations. "
+                "If you hear a city name, keep it exactly."
+            ),
+        }
+    })
+
+    audio_bytes = read_wav_bytes(pcm16_wav_path)
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+    await ws_send(ws, {"type": "input_audio_buffer.append", "audio": audio_b64})
+    await ws_send(ws, {"type": "input_audio_buffer.commit"})
+
+    # Create a text response (transcription)
+    await ws_send(ws, {
+        "type": "response.create",
+        "response": {
+            "modalities": ["text"],
+            "instructions": "TRANSCRIBE ONLY. Output only the transcript text.",
+        }
+    })
+
+    log("🕵️ Waiting for transcript events...")
+    events = await recv_loop(ws, stop_types={"response.done", "response.completed"}, debug_prefix="EVENT")
+
+    # Prefer response.text.delta. If your deployment emits transcript deltas instead, fallback.
+    transcript = extract_text_deltas(events, "response.text.delta").strip()
+    if not transcript:
+        transcript = extract_text_deltas(events, "response.audio_transcript.delta").strip()
+
+    log(f"✅ Final Transcript: {transcript}")
+    return transcript
+
+
+# =========================
+# PHASE 1.5: City extraction (text -> strict JSON)
+# =========================
+async def extract_city_with_model(ws, transcript: str) -> Optional[str]:
+    log("1.5) Extracting city using model (strict JSON).")
+
+    await ws_send(ws, {
+        "type": "session.update",
+        "session": {
+            "modalities": ["text"],
+            "instructions": (
+                "Extract the city name from the user's transcript. "
+                "Return STRICT JSON only, no markdown, no extra text. "
+                'Schema: {"city": "<city-or-empty>"} '
+                "If no city is present, return empty string."
+            )
+        }
+    })
+
+    await ws_send(ws, {
+        "type": "response.create",
+        "response": {
+            "modalities": ["text"],
+            "instructions": (
+                f'Transcript: "{transcript}"\n'
+                'Return JSON now.'
+            )
+        }
+    })
+
+    events = await recv_loop(ws, stop_types={"response.done", "response.completed"}, debug_prefix="EVENT")
+    txt = (extract_text_deltas(events, "response.text.delta") or "").strip()
+    log(f"📦 City JSON raw: {txt}")
+
+    # Parse JSON safely
+    city = None
+    try:
+        data = json.loads(txt)
+        city = (data.get("city") or "").strip()
+    except Exception:
+        # If model returned extra text (shouldn't), try a small fallback
+        m = re.search(r'"city"\s*:\s*"([^"]*)"', txt)
+        if m:
+            city = m.group(1).strip()
+
+    if city:
+        log(f"✅ Extracted city: {city}")
+    else:
+        log("❌ Could not extract city from transcript.")
+    return city
+
+
+# =========================
+# PHASE 2: TTS (weather text -> output.wav)
+# =========================
+async def phase2_tts(ws, weather_text: str, out_wav_path: str):
+    log("2) Phase-2 TTS: generating English audio response.")
+
+    await ws_send(ws, {
+        "type": "session.update",
+        "session": {
+            # To get audio output, your deployment expects ["audio","text"] combination.
+            "modalities": ["text", "audio"],
+            "voice": VOICE,
+            "instructions": (
+                "You are a text-to-speech assistant. "
+                "Speak ONLY in English. "
+                "Do not add warnings, disclaimers, or generic advice. "
+                "Read the provided weather text clearly."
+            )
+        }
+    })
+
+    await ws_send(ws, {
+        "type": "response.create",
+        "response": {
+            "modalities": ["audio", "text"],
+            "instructions": weather_text
+        }
+    })
+
+    log("🔊 Waiting for audio chunks...")
+    events = await recv_loop(ws, stop_types={"response.done", "response.completed"}, debug_prefix="EVENT")
+
+    # If error occurs, print it clearly
+    for e in events:
+        if e.get("type") == "error":
+            log(f"❌ ERROR EVENT: {json.dumps(e, indent=2)}")
+
+    pcm = extract_audio_bytes(events)
+    if not pcm:
+        raise RuntimeError(
+            "No audio received. Your deployment may not support audio output (voice), "
+            "or voice permission not enabled, or wrong deployment/endpoint."
+        )
+
+    write_wav(out_wav_path, pcm, sr=OUT_SR, ch=OUT_CH, sw=OUT_SW)
+    log(f"✅ Output saved: {out_wav_path}")
+
+
+# =========================
+# MAIN
+# =========================
+async def main():
+    log("=== Weather S2S Debug Pipeline ===")
+    in_path = input("Enter input audio file path (wav/mp3/etc): ").strip()
+    out_path = input("Enter output wav file path (e.g., output.wav): ").strip()
+    if not out_path:
+        out_path = "output.wav"
+
+    # Convert input -> 16k PCM16 mono wav
+    pcm16_path = convert_to_16k_pcm16_mono(in_path)
+
+    log("Connecting to Azure Realtime WS...")
+    async with websockets.connect(
+        AZURE_ENDPOINT,
+        additional_headers={"api-key": AZURE_API_KEY},
+        max_size=50 * 1024 * 1024,
+        ping_interval=20,
+        ping_timeout=20,
+    ) as ws:
+        log("✅ Connected.")
+
+        # Phase 1 STT
+        transcript = await phase1_transcribe(ws, pcm16_path)
+        if not transcript:
+            raise RuntimeError("Empty transcript. Check input audio content/volume.")
+
+        # Phase 1.5 City extraction
+        city = await extract_city_with_model(ws, transcript)
+        if not city:
+            raise RuntimeError(
+                "Could not detect city in audio. "
+                "Try speaking like: 'What is the weather in Hyderabad?'"
+            )
+
+        # Tool call (server-side)
+        weather = fetch_weather(city)
+
+        # IMPORTANT: produce a factual text with tool data (no generic advice)
+        weather_text = (
+            f"Current weather for {weather.city}: "
+            f"temperature {weather.temp_c:.1f} degrees Celsius, "
+            f"wind speed {weather.wind_kmh:.1f} kilometers per hour. "
+            f"(Open-Meteo weather code {weather.weather_code}.)"
+        )
+        log(f"🌦️ Tool result text: {weather_text}")
+
+        # Phase 2 TTS
+        await phase2_tts(ws, weather_text, out_path)
+
+    log("=== Done ===")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
