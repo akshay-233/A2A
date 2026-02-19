@@ -1,0 +1,362 @@
+import asyncio
+import base64
+import json
+import os
+import subprocess
+import time
+import wave
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import requests
+import websockets
+
+
+# =========================
+# CONFIG (Azure Realtime)
+# =========================
+AZURE_RESOURCE = "YOUR_RESOURCE_NAME"  # e.g. "blueverse-gpt5"
+AZURE_DEPLOYMENT = "gpt-40-mini-realtime-preveiw"  # user provided
+AZURE_API_VERSION = "2024-10-01-preview"
+AZURE_API_KEY = os.getenv("AZURE_OPENAI_KEY", "YOUR_API_KEY")
+
+AZURE_ENDPOINT = (
+    f"wss://{AZURE_RESOURCE}.openai.azure.com/openai/realtime"
+    f"?api-version={AZURE_API_VERSION}&deployment={AZURE_DEPLOYMENT}"
+)
+
+# Input/Output
+INPUT_WAV = "input.wav"
+CONVERTED_WAV = "input_16k_pcm16_mono.wav"
+OUTPUT_WAV = "output.wav"
+
+# Voice control (OpenAI-style voices used in many realtime deployments)
+# Try: "onyx" (male), "echo" (male), "alloy" (neutral)
+TTS_VOICE = "onyx"
+
+# Timeouts
+WS_RECV_TIMEOUT_S = 30
+HTTP_TIMEOUT_S = 10
+
+
+# =========================
+# Helpers (logging)
+# =========================
+def ts() -> str:
+    return time.strftime("%H:%M:%S")
+
+def log(msg: str):
+    print(f"[{ts()}] {msg}", flush=True)
+
+
+# =========================
+# Audio conversion to 16k PCM16 mono
+# =========================
+def ensure_ffmpeg():
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    except Exception:
+        raise RuntimeError("ffmpeg not found. Install it: sudo apt-get install -y ffmpeg")
+
+def convert_to_16k_pcm16_mono(in_path: str, out_path: str) -> None:
+    """
+    Convert ANY input audio (any kHz/channels) to 16kHz mono PCM16 WAV.
+    """
+    ensure_ffmpeg()
+    if not os.path.exists(in_path):
+        raise FileNotFoundError(f"Input file not found: {in_path}")
+
+    log("Converting audio to 16kHz PCM16 mono via ffmpeg...")
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", in_path,
+        "-ac", "1",
+        "-ar", "16000",
+        "-c:a", "pcm_s16le",
+        out_path
+    ]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"ffmpeg conversion failed:\n{p.stderr}")
+    log("Conversion complete.")
+
+def wav_info(path: str) -> Tuple[int, int, int, int]:
+    with wave.open(path, "rb") as wf:
+        return wf.getnchannels(), wf.getsampwidth(), wf.getframerate(), wf.getnframes()
+
+def read_wav_bytes(path: str) -> bytes:
+    with wave.open(path, "rb") as wf:
+        return wf.readframes(wf.getnframes())
+
+def write_pcm16_wav(path: str, pcm16_bytes: bytes, sample_rate: int = 16000):
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm16_bytes)
+
+
+# =========================
+# Open-Meteo Tool (FREE)
+# =========================
+@dataclass
+class WeatherResult:
+    name: str
+    country: Optional[str]
+    latitude: float
+    longitude: float
+    temperature_c: float
+    windspeed_kmh: float
+
+def open_meteo_geocode(query: str) -> Optional[dict]:
+    """
+    Free geocoding (no API key) by Open-Meteo.
+    """
+    url = "https://geocoding-api.open-meteo.com/v1/search"
+    params = {"name": query, "count": 1, "language": "en", "format": "json"}
+    r = requests.get(url, params=params, timeout=HTTP_TIMEOUT_S)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("results"):
+        return None
+    return data["results"][0]
+
+def open_meteo_current_weather(lat: float, lon: float) -> dict:
+    """
+    Free forecast endpoint (no API key).
+    """
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current_weather": "true",
+        "timezone": "auto",
+    }
+    r = requests.get(url, params=params, timeout=HTTP_TIMEOUT_S)
+    r.raise_for_status()
+    return r.json()
+
+def fetch_weather(query: str) -> WeatherResult:
+    log(f"TOOL: Geocoding via Open-Meteo for query = {query!r}")
+    place = open_meteo_geocode(query)
+    if not place:
+        raise RuntimeError(f"TOOL: Could not geocode location from query: {query}")
+
+    name = place.get("name", query)
+    country = place.get("country")
+    lat = float(place["latitude"])
+    lon = float(place["longitude"])
+
+    log(f"TOOL: Geocode result => {name}, {country}, lat={lat}, lon={lon}")
+    log("TOOL: Fetching current weather via Open-Meteo forecast API...")
+
+    data = open_meteo_current_weather(lat, lon)
+    cw = data.get("current_weather")
+    if not cw:
+        raise RuntimeError("TOOL: Open-Meteo did not return current_weather.")
+
+    temp = float(cw["temperature"])
+    wind = float(cw["windspeed"])
+    log(f"TOOL: Weather => temp={temp}°C, wind={wind} km/h")
+
+    return WeatherResult(
+        name=name,
+        country=country,
+        latitude=lat,
+        longitude=lon,
+        temperature_c=temp,
+        windspeed_kmh=wind,
+    )
+
+
+# =========================
+# Azure Realtime WebSocket helpers
+# =========================
+async def ws_send(ws, obj):
+    await ws.send(json.dumps(obj))
+
+async def ws_recv_json(ws, timeout_s: int = WS_RECV_TIMEOUT_S) -> dict:
+    msg = await asyncio.wait_for(ws.recv(), timeout=timeout_s)
+    return json.loads(msg)
+
+async def connect_ws():
+    log(f"Connecting to Azure Realtime WS: {AZURE_ENDPOINT}")
+    return await websockets.connect(
+        AZURE_ENDPOINT,
+        additional_headers={"api-key": AZURE_API_KEY},
+        max_size=50 * 1024 * 1024,
+        ping_interval=20,
+        ping_timeout=20,
+    )
+
+
+# =========================
+# Phase 1: STT (Audio -> Text ONLY)
+# =========================
+async def stt_transcribe_audio(audio_wav_16k_pcm16: str) -> str:
+    """
+    Deterministic STT phase:
+    - modalities: ["text"] only
+    - output: transcript string only
+    """
+    ch, sw, sr, nf = wav_info(audio_wav_16k_pcm16)
+    log(f"Converted Audio Info => channels={ch}, sample_width={sw}, rate={sr}, frames={nf}")
+    if sr != 16000 or ch != 1 or sw != 2:
+        raise RuntimeError("Converted wav is not 16kHz mono PCM16. Fix conversion first.")
+
+    audio_bytes = read_wav_bytes(audio_wav_16k_pcm16)
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+    async with await connect_ws() as ws:
+        log("WS connected (STT). Updating session for TEXT-only...")
+        await ws_send(ws, {
+            "type": "session.update",
+            "session": {
+                "modalities": ["text"],   # IMPORTANT: STT phase should only return text
+            }
+        })
+
+        log("Sending audio buffer...")
+        await ws_send(ws, {"type": "input_audio_buffer.append", "audio": audio_b64})
+        await ws_send(ws, {"type": "input_audio_buffer.commit"})
+
+        # Ask model to output ONLY transcript (no JSON, no extra words)
+        log("Requesting transcript...")
+        await ws_send(ws, {
+            "type": "response.create",
+            "response": {
+                "modalities": ["text"],
+                "instructions": (
+                    "Transcribe the user's audio into English text. "
+                    "Return ONLY the transcript as plain text. "
+                    "Do NOT output JSON. Do NOT add any extra words."
+                ),
+            }
+        })
+
+        transcript_parts = []
+        while True:
+            event = await ws_recv_json(ws)
+            et = event.get("type", "")
+            if et == "error":
+                log(f"EVENT(STT): error => {event}")
+                raise RuntimeError(f"STT error: {event}")
+
+            # Debug print the event types (helps you see where it hangs)
+            if et.endswith(".delta") or et.endswith(".done") or et in ("session.created", "session.updated", "response.done"):
+                log(f"EVENT(STT): {et}")
+
+            if et == "response.text.delta":
+                transcript_parts.append(event.get("delta", ""))
+
+            if et == "response.text.done":
+                # some deployments send final chunk here
+                pass
+
+            if et == "response.done":
+                break
+
+        transcript = "".join(transcript_parts).strip()
+        log(f"STT Transcript => {transcript!r}")
+        if not transcript:
+            raise RuntimeError("STT produced empty transcript.")
+        return transcript
+
+
+# =========================
+# Phase 2: TTS (Text -> Audio ONLY)
+# =========================
+async def tts_speak_text(text: str, out_wav: str):
+    """
+    Deterministic TTS phase:
+    - modalities: ["audio"] only
+    - voice forced
+    - strict: no greetings, no filler, speak only provided content
+    """
+    async with await connect_ws() as ws:
+        log("WS connected (TTS). Updating session for AUDIO-only...")
+        await ws_send(ws, {
+            "type": "session.update",
+            "session": {
+                "modalities": ["audio"],
+                "voice": TTS_VOICE,
+            }
+        })
+
+        log("Requesting AUDIO response...")
+        await ws_send(ws, {
+            "type": "response.create",
+            "response": {
+                "modalities": ["audio"],
+                "instructions": (
+                    "Speak ONLY the provided content. "
+                    "Do NOT add greetings. Do NOT add disclaimers. "
+                    "Do NOT add follow up questions. "
+                    "English only. Clear male voice."
+                ),
+                # Some deployments accept `input` as a string.
+                # If yours requires a different key, tell me the error event and I’ll adjust.
+                "input": text
+            }
+        })
+
+        audio_out = bytearray()
+        while True:
+            event = await ws_recv_json(ws)
+            et = event.get("type", "")
+
+            if et == "error":
+                log(f"EVENT(TTS): error => {event}")
+                raise RuntimeError(f"TTS error: {event}")
+
+            if et.endswith(".delta") or et.endswith(".done") or et in ("session.created", "session.updated", "response.done"):
+                log(f"EVENT(TTS): {et}")
+
+            if et == "response.audio.delta":
+                audio_out.extend(base64.b64decode(event["delta"]))
+
+            if et == "response.done":
+                break
+
+        if not audio_out:
+            raise RuntimeError("No audio received in TTS phase (response.audio.delta never arrived).")
+
+        write_pcm16_wav(out_wav, bytes(audio_out), sample_rate=16000)
+        log(f"✅ Saved audio => {out_wav}")
+
+
+# =========================
+# Main pipeline
+# =========================
+async def main():
+    log("=== WEATHER S2S PIPELINE (Deterministic STT -> Tool -> TTS) ===")
+    log(f"Input:  {INPUT_WAV}")
+    log(f"Output: {OUTPUT_WAV}")
+
+    # 1) Convert input audio to 16k PCM16 mono
+    convert_to_16k_pcm16_mono(INPUT_WAV, CONVERTED_WAV)
+
+    # 2) STT
+    transcript = await stt_transcribe_audio(CONVERTED_WAV)
+
+    # 3) Tool call (we DO NOT let the model decide this)
+    # Use the full transcript as query; geocoder will find the best location.
+    weather = fetch_weather(transcript)
+
+    # 4) Backend formats the final sentence (this prevents hallucination/filler)
+    place_label = weather.name + (f", {weather.country}" if weather.country else "")
+    final_sentence = (
+        f"Current weather in {place_label}. "
+        f"Temperature {weather.temperature_c:.1f} degrees Celsius. "
+        f"Wind speed {weather.windspeed_kmh:.1f} kilometers per hour."
+    )
+    log(f"FINAL TEXT (tool-grounded) => {final_sentence}")
+
+    # 5) TTS (audio only)
+    await tts_speak_text(final_sentence, OUTPUT_WAV)
+
+    log("=== DONE ===")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
