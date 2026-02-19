@@ -1,0 +1,384 @@
+"""
+weather_audio_debug.py
+
+Goal:
+- Ask user for a city (text input)
+- Call a FREE weather source (Open-Meteo via geocoding)
+- Send the weather summary to Azure OpenAI Realtime over WebSocket
+- Force tool calling (so you can SEE tool events)
+- Get AUDIO output (response.audio.delta) and save to response.wav
+- Extremely verbose debug logs so you can see exactly where it fails
+
+Prereqs:
+pip install websockets requests
+
+Run:
+python3 weather_audio_debug.py
+
+Notes:
+- If you get "Invalid modalities ['audio']" or "No audio received":
+  Your Azure deployment may not support AUDIO output. You must use a realtime-capable deployment with audio enabled.
+"""
+
+import asyncio
+import base64
+import json
+import os
+import sys
+import time
+import wave
+from typing import Any, Dict, Optional
+
+import requests
+import websockets
+
+# =========================
+# CONFIG (EDIT THESE)
+# =========================
+AZURE_RESOURCE = os.getenv("AZURE_RESOURCE_NAME", "YOUR_RESOURCE_NAME")
+AZURE_DEPLOYMENT = os.getenv("AZURE_DEPLOYMENT_NAME", "YOUR_DEPLOYMENT_NAME")
+AZURE_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "YOUR_API_KEY")
+
+# Realtime WS endpoint
+AZURE_ENDPOINT = (
+    f"wss://{AZURE_RESOURCE}.openai.azure.com/openai/realtime"
+    f"?api-version=2024-10-01-preview&deployment={AZURE_DEPLOYMENT}"
+)
+
+VOICE = "alloy"
+OUT_WAV = "response.wav"
+
+# Output audio format we will write (most realtime audio deltas are PCM16 @ 16k in many examples;
+# Some deployments return different formats. We'll still write as PCM16/16k for debugging.)
+OUT_CHANNELS = 1
+OUT_SAMPWIDTH = 2  # 16-bit
+OUT_RATE = 16000
+
+MAX_WS_MSG = 20 * 1024 * 1024
+
+# =========================
+# FREE WEATHER TOOL (Open-Meteo)
+# =========================
+def geocode_city(city: str) -> Dict[str, Any]:
+    """
+    Open-Meteo geocoding:
+    https://geocoding-api.open-meteo.com/v1/search?name=Chennai&count=1&language=en&format=json
+    """
+    url = "https://geocoding-api.open-meteo.com/v1/search"
+    params = {"name": city, "count": 1, "language": "en", "format": "json"}
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("results"):
+        raise ValueError(f"No geocoding results for city={city!r}")
+    top = data["results"][0]
+    return {
+        "name": top.get("name"),
+        "country": top.get("country"),
+        "latitude": top.get("latitude"),
+        "longitude": top.get("longitude"),
+        "timezone": top.get("timezone"),
+    }
+
+def fetch_weather_open_meteo(city: str) -> Dict[str, Any]:
+    """
+    Open-Meteo current weather:
+    https://api.open-meteo.com/v1/forecast?latitude=...&longitude=...&current=temperature_2m,wind_speed_10m&timezone=auto
+    """
+    geo = geocode_city(city)
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": geo["latitude"],
+        "longitude": geo["longitude"],
+        "current": "temperature_2m,wind_speed_10m",
+        "timezone": "auto",
+    }
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    cur = data.get("current", {})
+    return {
+        "location": f'{geo["name"]}, {geo["country"]}',
+        "latitude": geo["latitude"],
+        "longitude": geo["longitude"],
+        "timezone": data.get("timezone"),
+        "temperature_c": cur.get("temperature_2m"),
+        "wind_kph": cur.get("wind_speed_10m"),
+        "time": cur.get("time"),
+        "raw": data,  # keep raw for debugging
+    }
+
+def build_weather_summary(w: Dict[str, Any]) -> str:
+    return (
+        f"Weather for {w['location']} (local time {w.get('time')}): "
+        f"temperature {w.get('temperature_c')}°C, wind speed {w.get('wind_kph')} km/h."
+    )
+
+# =========================
+# TOOL DEFINITIONS FOR AZURE REALTIME
+# =========================
+WEATHER_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city using Open-Meteo.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "City name, e.g., Chennai"}
+            },
+            "required": ["city"],
+        },
+    },
+}
+
+# =========================
+# DEBUG HELPERS
+# =========================
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+def pretty_event(data: Dict[str, Any]) -> str:
+    t = data.get("type")
+    # Keep it short but useful
+    if t in ("response.text.delta", "response.audio.delta"):
+        return f"{t} (delta_len={len(data.get('delta',''))})"
+    if t and "function_call" in t:
+        return f"{t} keys={list(data.keys())}"
+    return f"{t} keys={list(data.keys())}"
+
+# =========================
+# MAIN REALTIME FLOW
+# =========================
+async def run_weather_tts(city: str) -> None:
+    log("========================================")
+    log("1) Connecting to Azure Realtime WebSocket")
+    log("========================================")
+    log(f"Endpoint: {AZURE_ENDPOINT}")
+
+    # Collect audio bytes returned by the model
+    output_audio_pcm16 = b""
+    collected_text = ""
+
+    async with websockets.connect(
+        AZURE_ENDPOINT,
+        additional_headers={"api-key": AZURE_API_KEY},
+        max_size=MAX_WS_MSG,
+    ) as ws:
+        log("✅ Connected.")
+
+        # -------------------------
+        # 2) session.update
+        # -------------------------
+        # IMPORTANT:
+        # modalities includes both "text" and "audio" because we want AUDIO output.
+        # We also register the tool and strongly instruct to use tool for weather questions.
+        session_update = {
+            "type": "session.update",
+            "session": {
+                "modalities": ["text", "audio"],
+                "voice": VOICE,
+                "tools": [WEATHER_TOOL_SCHEMA],
+                "instructions": (
+                    "You are a weather assistant. "
+                    "For any weather question, ALWAYS call the get_weather tool first, "
+                    "then answer using the tool result. "
+                    "Reply in a single short paragraph."
+                ),
+            },
+        }
+        await ws.send(json.dumps(session_update))
+        log("➡️ Sent: session.update")
+
+        # -------------------------
+        # 3) Send the user request (TEXT)
+        # -------------------------
+        # Put a clear user message so the model knows it's a weather request.
+        user_prompt = f"What is the current weather in {city}?"
+        conversation_create = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": user_prompt}],
+            },
+        }
+        await ws.send(json.dumps(conversation_create))
+        log(f"➡️ Sent user message: {user_prompt!r}")
+
+        # -------------------------
+        # 4) response.create (FORCE TOOL CALL)
+        # -------------------------
+        # tool_choice auto = model may or may not call tool
+        # For debugging, we FORCE get_weather so you can confirm tool-calling wiring works.
+        response_create = {
+            "type": "response.create",
+            "response": {
+                "modalities": ["text", "audio"],
+                "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+            },
+        }
+        await ws.send(json.dumps(response_create))
+        log("➡️ Sent: response.create (FORCING get_weather tool)")
+
+        # -------------------------
+        # 5) Event loop
+        # -------------------------
+        log("========================================")
+        log("2) Listening for events (debug verbose)")
+        log("========================================")
+
+        tool_call_name: Optional[str] = None
+        tool_call_args_json = ""
+
+        while True:
+            raw = await ws.recv()
+            data = json.loads(raw)
+            etype = data.get("type")
+            log(f"EVENT: {pretty_event(data)}")
+
+            # Session is ready
+            if etype == "session.created":
+                continue
+
+            # Some deployments send errors as events
+            if etype == "error":
+                log(f"❌ ERROR EVENT: {json.dumps(data, indent=2)}")
+                break
+
+            # Tool call arguments streaming
+            if etype == "response.function_call_arguments.delta":
+                # delta is a string chunk
+                tool_call_args_json += data.get("delta", "")
+                continue
+
+            if etype == "response.function_call_arguments.done":
+                # done indicates we have full args
+                tool_call_name = data.get("name") or data.get("function", {}).get("name")
+                # Some payloads store "arguments" on done
+                if data.get("arguments"):
+                    tool_call_args_json = data["arguments"]
+                log(f"✅ Tool call requested: {tool_call_name}, args={tool_call_args_json!r}")
+
+                # Execute tool locally (our backend)
+                try:
+                    args = json.loads(tool_call_args_json) if tool_call_args_json else {}
+                except Exception:
+                    args = {"city": city}  # fallback
+
+                tool_city = args.get("city", city)
+                log(f"🛠️ Running tool get_weather(city={tool_city!r}) ...")
+
+                try:
+                    weather = fetch_weather_open_meteo(tool_city)
+                    summary = build_weather_summary(weather)
+                    tool_result = {
+                        "ok": True,
+                        "summary": summary,
+                        "data": {
+                            "location": weather["location"],
+                            "temperature_c": weather["temperature_c"],
+                            "wind_kph": weather["wind_kph"],
+                            "time": weather["time"],
+                            "timezone": weather["timezone"],
+                            "lat": weather["latitude"],
+                            "lon": weather["longitude"],
+                        },
+                    }
+                    log(f"✅ Tool result summary: {summary}")
+                except Exception as e:
+                    tool_result = {"ok": False, "error": str(e)}
+                    log(f"❌ Tool failed: {e!r}")
+
+                # Send tool result back
+                # IMPORTANT: Use conversation.item.create with type=function_call_output
+                tool_output_event = {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": data.get("call_id"),
+                        "output": json.dumps(tool_result),
+                    },
+                }
+                await ws.send(json.dumps(tool_output_event))
+                log("➡️ Sent: function_call_output to model")
+
+                # Now ask model to continue generating the final answer (text + audio)
+                await ws.send(json.dumps({"type": "response.create", "response": {"modalities": ["text", "audio"]}}))
+                log("➡️ Sent: response.create (after tool output)")
+                continue
+
+            # Text streaming
+            if etype == "response.text.delta":
+                delta = data.get("delta", "")
+                collected_text += delta
+                continue
+
+            if etype == "response.text.done":
+                log(f"✅ Final text:\n{collected_text}")
+                continue
+
+            # Audio streaming (base64 PCM chunks)
+            if etype == "response.audio.delta":
+                b64 = data.get("delta", "")
+                try:
+                    chunk = base64.b64decode(b64)
+                    output_audio_pcm16 += chunk
+                except Exception as e:
+                    log(f"⚠️ Failed decoding audio delta: {e!r}")
+                continue
+
+            if etype == "response.audio.done":
+                log(f"✅ Audio stream done. bytes={len(output_audio_pcm16)}")
+                continue
+
+            # Completion
+            if etype in ("response.done", "response.completed"):
+                log("✅ Response done event received.")
+                break
+
+        # -------------------------
+        # 6) Save WAV (if any audio)
+        # -------------------------
+        log("========================================")
+        log("3) Saving WAV output")
+        log("========================================")
+        if not output_audio_pcm16:
+            log("❌ No audio received.")
+            log("Common reasons:")
+            log("- Your deployment does not support audio output.")
+            log("- Voice permissions not enabled for the deployment.")
+            log("- Wrong endpoint/deployment name.")
+            log("- response.create didn't request modalities ['audio'] (but we did).")
+            return
+
+        with wave.open(OUT_WAV, "wb") as wf:
+            wf.setnchannels(OUT_CHANNELS)
+            wf.setsampwidth(OUT_SAMPWIDTH)
+            wf.setframerate(OUT_RATE)
+            wf.writeframes(output_audio_pcm16)
+
+        log(f"✅ Saved: {OUT_WAV}")
+        if collected_text.strip():
+            log("✅ Text also collected (printed above).")
+
+
+def main():
+    if "YOUR_RESOURCE_NAME" in AZURE_ENDPOINT or "YOUR_DEPLOYMENT_NAME" in AZURE_ENDPOINT or AZURE_API_KEY == "YOUR_API_KEY":
+        print("\n❌ Please set AZURE_RESOURCE_NAME / AZURE_DEPLOYMENT_NAME / AZURE_OPENAI_API_KEY (env) or edit the script.\n")
+        print("Example:")
+        print("export AZURE_RESOURCE_NAME='myresource'")
+        print("export AZURE_DEPLOYMENT_NAME='gpt-4o-mini-realtime-preview'")
+        print("export AZURE_OPENAI_API_KEY='xxxxx'")
+        sys.exit(1)
+
+    city = input("Enter city name (e.g., Chennai): ").strip()
+    if not city:
+        print("❌ City is required.")
+        sys.exit(1)
+
+    asyncio.run(run_weather_tts(city))
+
+
+if __name__ == "__main__":
+    main()
